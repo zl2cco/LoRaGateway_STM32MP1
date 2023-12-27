@@ -1,0 +1,667 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <signal.h>
+#include <regex.h>        
+#include <assert.h>
+#include <syslog.h>
+#include <libconfig.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <linux/gpio.h>
+
+int lora_reset();
+void logmsg ();
+void logerr(const char* msg);
+void logend();
+
+#define BUFSIZE 256
+
+static volatile int keepRunning = 1;
+
+#define RE_NODE "\"id\":[[:space:]]?-?[[:digit:]]+,[[:space:]]?\"lvl\":[[:space:]]?-?[[:digit:]]+,[[:space:]]?\"vbat\":[[:space:]]?-?[[:digit:]]+"
+#define RE_MSG "(\\+EVT:RXP2P:-?[[:digit:]]+:-?[[:digit:]]+:)(7B[[:alnum:]]*7D)"
+
+regex_t re_msg, re_node;
+
+int ARGC;
+char *FNAME;
+
+char cfg_port[BUFSIZE];
+char cfg_mqtt_app[BUFSIZE];
+char cfg_mqtt_host[BUFSIZE];
+char cfg_mqtt_topic[BUFSIZE];
+bool cfg_verbose;
+
+
+char *mqttargv[] = { "/usr/bin/mosquitto_pub", 
+                     "-h", "192.168.1.44", 
+                     "-t", "\"test\"", 
+                     "-m", "\"Hello\"", 
+                     NULL};
+char *mqttenv[] = { NULL };
+
+
+/*------------------------------------------------------------------------------------------*/
+void intHandler(int dummy) {
+    keepRunning = 0;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+int read_cfg (const char* cfg_fname)
+{
+	config_t cfg;
+	config_setting_t *setting;
+	const char *str;
+
+	config_init(&cfg);
+
+	/* Read the file. If there is an error, report it and exit. */
+	if(! config_read_file(&cfg, cfg_fname))
+	{
+		fprintf(stderr, "%s:%d - %s\n", config_error_file(&cfg),
+										config_error_line(&cfg), 
+										config_error_text(&cfg));
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
+
+	if(config_lookup_string(&cfg, "port", &str)) {
+		strcpy(cfg_port, str);
+		printf("PORT: %s\n", cfg_port);
+	}
+	else {
+		fprintf(stderr, "Config file error: serial port not specified\n");
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
+
+	if(config_lookup_string(&cfg, "mqtt.app", &str)) {
+		strcpy(cfg_mqtt_app, str);
+		printf("MQTT APP: %s\n", cfg_mqtt_app);
+	}
+	else {
+		fprintf(stderr, "Config file error: MQTT application not specified\n");
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
+
+	if(config_lookup_string(&cfg, "mqtt.host", &str)) {
+		strcpy(cfg_mqtt_host, str);
+		printf("MQTT HOST: %s\n", cfg_mqtt_host);
+	}
+	else {
+		fprintf(stderr, "Config file error: MQTT host address not specified\n");
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
+
+	if(config_lookup_string(&cfg, "mqtt.topic", &str)) {
+		strcpy(cfg_mqtt_topic, str);
+		printf("MQTT TOPIC: %s\n", cfg_mqtt_topic);
+	}
+	else {
+		fprintf(stderr, "Config file error: MQTT topic not specified\n");
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
+
+	if(config_lookup_string(&cfg, "verbose", &str))
+		if (str[0] == 'Y')
+			cfg_verbose = true;
+		else
+			cfg_verbose = false;
+
+	mqttargv[0] = cfg_mqtt_app;
+	mqttargv[2] = cfg_mqtt_host;
+	mqttargv[4] = cfg_mqtt_topic;
+
+	return(EXIT_SUCCESS);
+}
+
+/*------------------------------------------------------------------------------------------*/
+int regex_compile () 
+{
+	int i;
+	char buffer[BUFSIZE];
+	
+	i = regcomp(&re_msg, RE_MSG, REG_EXTENDED);
+	if (i) {
+		regerror(i, &re_msg, buffer, BUFSIZE);                                        
+		printf("regcomp() failed msg re with '%s'\n", buffer); 
+		return 1;
+	}
+
+
+	i = regcomp(&re_node, RE_NODE, REG_EXTENDED|REG_NOSUB);
+	if (i) {
+		regerror(i, &re_node, buffer, BUFSIZE);                                        
+		printf("regcomp() failed node re with '%s'\n", buffer); 
+		return 1;
+	}
+
+	return 0;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+void regex_free() 
+{
+	regfree(&re_msg);
+	regfree(&re_node);
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+//Unpack node packet using regex
+int regex_match_node(char *json)
+{
+  int ret = 0;
+
+  assert(json!=NULL);
+
+	if (!regexec(&re_node, json, 0, NULL, 0)) {
+		ret = 1;
+	}
+	else {
+	   ret = 0;
+  }
+
+  return ret;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+//Check for RXP2P packet using regex
+int regex_match_rxp2p(char *buf, char *out)
+{
+  regmatch_t match[3];
+  char *buffer;
+  int ret = 0;
+  int i;
+
+  assert(buf!=NULL);
+  assert(out!=NULL);
+
+  buffer = out;
+
+  i = regexec(&re_msg, buf, 3, match, 0);
+  if (i) {
+	   //regerror(i, &re_msg, buffer, 100);                                        
+       //printf("regexec() failed with '%s'\n", buffer); 
+  }
+  else if ((match[2].rm_so >= 0) && (match[2].rm_eo >= 0)) {
+/*
+	for (int i=0; i<3; i++) {
+	      printf("%d: %d - %d\t", i, match[i].rm_so, match[i].rm_eo);
+	   }
+*/
+		strncpy(buffer, buf+match[2].rm_so, match[2].rm_eo-match[2].rm_so);
+	   buffer[match[2].rm_eo-match[2].rm_so] = '\0';
+	   printf("REGEX MATCH: \"%s\" \n", buffer);
+	   ret = 1;
+  }
+
+
+  return ret;
+}
+
+
+
+
+/*------------------------------------------------------------------------------------------*/
+int send_cmd(int fd, const char* cmd)
+{
+	int len;
+
+	len = strlen(cmd);
+	if (len != write(fd, cmd, len)) {
+		printf("SEND: Bytes send are not the same as command length\n");
+	}
+
+	return len;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+int process_cmd(int fd, const char* cmd)
+{
+	char rxbuf[BUFSIZE];
+	int len;
+	int ret = 0;
+
+	//printf("SEND: %s", cmd);
+	len = send_cmd(fd, cmd);
+	return ret;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+int hex2string (char *in, char *out, int len)
+{
+	char buf[3];
+	unsigned long val;
+	int i=0;
+	char* ptr;
+	char ch = ' ';
+	int ret = 1;
+	int outi = 0;
+
+	while (ch != '}') {
+		buf[0] = in[i];
+		buf[1] = in[i+1];
+		buf[2] = 0;
+
+		ch = strtoul(buf, &ptr, 16);
+		out[outi] = ch;
+		outi++;
+		i += 2;
+		if (i > len) {
+			ret = 0;
+			break;
+		}
+	}
+
+	outi++;
+	out[outi] = 0;
+
+	return ret;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+int process_msg(int fd, char* msg, int len)
+{
+	int ret = 0;
+	char *ptr;
+	char buf[BUFSIZE];
+	int done = 1;
+	int l = len;
+
+	ptr = msg;
+
+	/*
+	 * Process OK message
+	 */
+	ptr = strstr(ptr, "OK");
+	if (ptr != NULL) {
+		ret++;	// Received OK message
+		ptr += 2;
+		l -= 2;
+		//printf("INFO: OK message received\n");
+	}
+	else ptr = msg;
+
+
+	/*
+	 * Process '+EVT:RXP2P:'  message
+	 */
+	ptr = strstr(ptr, "+EVT:RXP2P:");
+	if (ptr != NULL) {	
+		ptr += 11;
+		l -= 11;
+		ptr = strstr(ptr, ":");
+		if (ptr == NULL) return ret;
+		ptr++;
+		ptr = strstr(ptr, ":");
+		if (ptr == NULL) return ret;
+		ptr++;
+		l -= 2;
+
+		memset(buf, 0, BUFSIZE);
+		done = hex2string(ptr, buf, l);
+		//printf("PKG [%d] : %s\n\n", l, buf);
+		
+//		process_cmd(fd, "AT+PRECV=30000\n\r");
+	}
+
+	return ret;
+}
+
+
+
+/*------------------------------------------------------------------------------------------*/
+int process_node_msg(char* msg, int msg_len, char* packet, int packet_len)
+{
+	int ret = 0;
+	int done = 1;
+
+	assert(msg!=NULL);
+	assert(msg_len>0);
+	assert(packet!=NULL);
+	assert(packet_len>0);
+
+	memset(packet, 0, packet_len);
+	done = hex2string(msg, packet, msg_len);
+	ret = strlen(packet);
+	//printf("PKG [%d] : %s\n\n", ret, packet);
+
+	return ret;
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+void handle_sigchld(int sig) {
+    while (waitpid((pid_t)(-1), 0, WNOHANG) > 0) {}
+}
+
+
+
+/*------------------------------------------------------------------------------------------*/
+int lora_begin(char* port) {
+	struct termios options; /* Serial ports setting */
+
+	assert(port);
+	int fd = open(port, O_RDWR | O_NDELAY | O_NOCTTY);
+	if (fd < 0) {
+		perror("Error opening serial port");
+		return fd;
+	}
+
+	/* Read current serial port settings */
+	// tcgetattr(fd, &options);
+	
+	/* Set up serial port */
+	options.c_cflag = B115200 | CS8 | CLOCAL | CREAD;
+	options.c_iflag = IGNPAR;
+	options.c_oflag = 0;
+	options.c_lflag = ICANON;
+
+	/* Apply the settings */
+	tcflush(fd, TCIFLUSH);
+	tcsetattr(fd, TCSANOW, &options);
+
+	return fd;
+}
+
+void lora_config_cmd(int fd, const char* cmd) {
+	char rxbuf[BUFSIZE];
+	int  len, retries;
+
+	process_cmd(fd, cmd);
+	for (int i=0; i<3; i++) {
+		memset(rxbuf, 0, BUFSIZE);
+		sleep(1.5);
+		len = read(fd, rxbuf, BUFSIZE);
+		if (len > 0) {
+			if (process_msg(fd, rxbuf, len)) {
+				printf("OK rxd");
+				break;
+			}
+		}
+	}
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+void lora_config(int fd) {
+	//char rxbuf[BUFSIZE];
+	//int  len;
+
+	lora_reset();
+
+	printf("\nReset LoRa...");
+	lora_config_cmd(fd, "AT+RESET\n\r");
+
+	printf("\nSet P2P LoRa mode...");
+	lora_config_cmd(fd, "AT+NWM=0\n\r");
+
+	printf("\nSet LoRa frequency and modulation...");
+	lora_config_cmd(fd, "AT+P2P=915000000:7:0:0:6:5\n\r");
+
+	printf("\nSet LoRa sync word...");
+	lora_config_cmd(fd, "AT+SYNCWORD=1424\n\r");
+
+	/* Start LoRa P2P receive */
+	printf("\nStart LoRa P2P receive...");
+	lora_config_cmd(fd, "AT+PRECV=65534\n\r");
+
+	printf("\n\n");
+}
+
+/************************************************************************
+ * MAIN
+ */
+int main(int argc, char *argv[]) 
+{
+	int fd, len;
+	char txbuf[BUFSIZE];
+	char rxbuf[BUFSIZE];
+	char packet[BUFSIZE];
+	char node_packet[BUFSIZE];
+	int  state=0;
+	pid_t pid;
+
+    ARGC  = argc;
+    FNAME = argv[0];
+
+	/* Print banner */
+	printf("LoRa Gateway - stm32mp135d [%d]\r\n", argc);
+	printf("\tFILE: %s\n", __FILE__);
+	printf("\tDATE: %s %s\n", __DATE__, __TIME__);
+
+	logmsg ();
+	
+	/* Read configuration file */
+	if (argc == 2) {
+		if (read_cfg (argv[1]) == EXIT_FAILURE) {
+			logerr("Error occurred while reading configuration file");
+			return(EXIT_FAILURE);
+		}
+	}
+	else {
+		perror("Configuration filename argument not specified");
+		logerr("Configuration filename argument not specified");
+		return(EXIT_FAILURE);
+	}
+
+	/* Open serial port */
+	fd = lora_begin(cfg_port);
+	if (fd < 0) {
+		perror("Error opening serial port");
+		logerr("Error opening serial port");
+		return(EXIT_FAILURE);
+	}
+
+	/* Configure radio */
+	lora_config(fd);
+
+	/* Setup signal handlers */
+	signal(SIGINT, intHandler);
+	signal(SIGCHLD, handle_sigchld);
+
+	/* Compile regex */
+	if (regex_compile()) goto DONE;
+
+	/* Read from serial port, and process messages received */
+	sleep(0.5);
+	len = read(fd, rxbuf, BUFSIZE);
+	memset(packet, 0, BUFSIZE);
+	int packet_index = 0;
+
+	while (keepRunning) {
+		sleep(0.1);
+		memset(rxbuf, 0, BUFSIZE);
+		len = read(fd, rxbuf, BUFSIZE);
+		if (len > 0) {
+			if ((packet_index+len)<256)  {
+				printf("RXD[%d]: %s", len, rxbuf);	
+
+				memcpy(&packet[packet_index], rxbuf, len);
+				packet[packet_index+len] = '\0';
+
+
+				if (regex_match_rxp2p(packet, node_packet)) {
+					process_node_msg(node_packet, BUFSIZE, packet, BUFSIZE);
+					if (regex_match_node(packet)) {
+				   		printf("NODE PKG: %s\n\n", packet);
+						mqttargv[6] = packet;
+						pid = fork();
+						if (pid == 0) {
+               				execve(cfg_mqtt_app, mqttargv, mqttenv);
+							exit(0);
+						}
+				   }
+				   else {
+				   		printf("NODE PKG ERROR: %s\n\n", packet);
+				   }
+
+				   packet_index = 0;
+				   memset(packet, 0, BUFSIZE);
+				}
+				else {
+					packet_index = packet_index + len;
+					printf("\n");
+				}
+			}
+			else {
+				perror("ERROR: buffer overflow\n");
+				logerr("Buffer overflowed");
+				goto DONE;
+				
+			}
+		}
+	}
+
+	printf("\nCompleted test.\n");
+	process_cmd(fd, "AT+PRECV=0\n\r");
+	sleep(5);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+DONE:
+	logend();
+	regex_free();
+	len = read(fd, rxbuf, BUFSIZE);
+	close(fd);
+	return 0; 
+}
+
+
+
+
+
+
+
+/*------------------------------------------------------------------------------------------*/
+int lora_reset()
+{
+	struct gpiohandle_request req;
+	struct gpiohandle_data data;
+	char chrdev_name[20];
+	int fd, ret;
+
+	strcpy(chrdev_name, "/dev/gpiochip4");
+
+	/*  Open device: gpiochip4 for GPIO bank A */
+	fd = open(chrdev_name, 0);
+	if (fd == -1) {
+		ret = -errno;
+		fprintf(stderr, "Failed to open %s\n", chrdev_name);
+
+		return ret;
+	}
+
+	/* request GPIO line: GPIO_A_14 */
+	req.lineoffsets[0] = 14;
+	req.flags = GPIOHANDLE_REQUEST_OUTPUT;
+	memcpy(req.default_values, &data, sizeof(req.default_values));
+	strcpy(req.consumer_label, "led_gpio_e_14");
+	req.lines  = 1;
+
+	ret = ioctl(fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
+	if (ret == -1) {
+		ret = -errno;
+		fprintf(stderr, "Failed to issue GET LINEHANDLE IOCTL (%d)\n",
+			ret);
+	}
+	if (close(fd) == -1)
+		perror("Failed to close GPIO character device file");
+
+	/*  Start led blinking */
+	data.values[0] = 0;
+	ret = ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+	if (ret == -1) {
+		ret = -errno;
+		fprintf(stderr, "Failed to issue %s (%d)\n",
+				"GPIOHANDLE_SET_LINE_VALUES_IOCTL", ret);
+	}
+	sleep(0.2);
+	data.values[0] = 1;
+	ret = ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+	if (ret == -1) {
+		ret = -errno;
+		fprintf(stderr, "Failed to issue %s (%d)\n",
+				"GPIOHANDLE_SET_LINE_VALUES_IOCTL", ret);
+	}
+
+	/*  release line */
+	ret = close(req.fd);
+	if (ret == -1) {
+		perror("Failed to close GPIO LINEHANDLE device file");
+		ret = -errno;
+	}
+	return ret;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*------------------------------------------------------------------------------------------*/
+void logmsg()
+{
+	setlogmask (LOG_UPTO (LOG_INFO));
+
+	openlog ("LoRaGW", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+
+	syslog (LOG_NOTICE, "Program started by User %d", getuid ());
+	syslog (LOG_NOTICE, " file: %s, date: %s %d" , FNAME, __DATE__, __TIME__);
+//	syslog (LOG_INFO, "A tree falls in a forest");
+
+	closelog ();
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+void logerr(const char* msg)
+{
+	setlogmask (LOG_UPTO (LOG_INFO));
+
+	openlog ("LoRaGW", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+
+	syslog (LOG_ERR, "%s", msg);
+//	syslog (LOG_INFO, "A tree falls in a forest");
+
+	closelog ();
+}
+
+
+/*------------------------------------------------------------------------------------------*/
+void logend()
+{
+	setlogmask (LOG_UPTO (LOG_INFO));
+
+	openlog ("LoRaGW", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+
+	syslog (LOG_NOTICE, "Program exit");
+//	syslog (LOG_INFO, "A tree falls in a forest");
+
+	closelog ();
+}

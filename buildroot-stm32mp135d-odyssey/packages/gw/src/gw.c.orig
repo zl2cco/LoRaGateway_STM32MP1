@@ -1,0 +1,278 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <signal.h>
+#include <regex.h>        
+regex_t regex;
+
+const int BUFSIZE = 256;
+
+static volatile int keepRunning = 1;
+
+void intHandler(int dummy) {
+    keepRunning = 0;
+}
+
+int send_cmd(int fd, const char* cmd)
+{
+	int len;
+
+	len = strlen(cmd);
+	if (len != write(fd, cmd, len)) {
+		printf("SEND: Bytes send are not the same as command length\n");
+	}
+
+	return len;
+}
+
+int process_cmd(int fd, const char* cmd)
+{
+	char rxbuf[BUFSIZE];
+	int len;
+	int ret = 0;
+
+	printf("SEND: %s", cmd);
+	len = send_cmd(fd, cmd);
+	return ret;
+}
+
+int hex2string (char *in, char *out, int len)
+{
+	char buf[3];
+	unsigned long val;
+	int i=0;
+	char* ptr;
+	char ch = ' ';
+	int ret = 1;
+	int outi = 0;
+
+	while (ch != '}') {
+		buf[0] = in[i];
+		buf[1] = in[i+1];
+		buf[2] = 0;
+
+		ch = strtoul(buf, &ptr, 16);
+		out[outi] = ch;
+		outi++;
+		i += 2;
+		if (i > len) {
+			ret = 0;
+			break;
+		}
+	}
+
+	outi++;
+	out[outi] = 0;
+
+	return ret;
+}
+
+int process_msg(int fd, char* msg, int len)
+{
+	int ret = 0;
+	char *ptr;
+	char buf[BUFSIZE];
+	int done = 1;
+	int l = len;
+
+	ptr = msg;
+
+	/*
+	 * Process OK message
+	 */
+	ptr = strstr(ptr, "OK");
+	if (ptr != NULL) {
+		ret++;	// Received OK message
+		ptr += 2;
+		l -= 2;
+		printf("INFO: OK message received\n");
+	}
+	else ptr = msg;
+
+
+	/*
+	 * Process '+EVT:RXP2P:'  message
+	 */
+	ptr = strstr(ptr, "+EVT:RXP2P:");
+	if (ptr != NULL) {	
+		ptr += 11;
+		l -= 11;
+		ptr = strstr(ptr, ":");
+		if (ptr == NULL) return ret;
+		ptr++;
+		ptr = strstr(ptr, ":");
+		if (ptr == NULL) return ret;
+		ptr++;
+		l -= 2;
+
+		memset(buf, 0, BUFSIZE);
+		done = hex2string(ptr, buf, l);
+		printf("PKG [%d] : %s\n\n", l, buf);
+		
+//		process_cmd(fd, "AT+PRECV=30000\n\r");
+	}
+
+	return ret;
+}
+
+int atohex (char* a, const char* h, int len, int N)
+{
+	int i, n;
+	char buf[3];
+	char* ptr;
+	int ret=0;
+
+	n = N;
+	for (i=0; i<(len-2); i+=2) {
+		buf[0] = a[i];
+		buf[1] = a[i+1];
+		buf[2] = 0;
+
+		char ch = strtoul(buf, &ptr, 16);
+		h[n] = ch;
+		n++;
+			if (n > BUFSIZE) {
+				ret = -1;
+				break;
+			}
+		}
+
+	ret = n;
+	return ret;
+}
+
+int main(int argc, char *argv[]) 
+{
+	int fd, len;
+	char txbuf[BUFSIZE];
+	char rxbuf[BUFSIZE];
+	char packet[BUFSIZE];
+	int  state=0;
+	struct termios options; /* Serial ports setting */
+
+	printf("LoRa Gateway - stm32mp135d [%d]\r\n", argc);
+	
+	if (argc == 2) {
+		printf("%s, %s \n", argv[0], argv[1]);
+		fd = open(argv[1], O_RDWR | O_NDELAY | O_NOCTTY);
+		if (fd < 0) {
+			perror("Error opening serial port");
+			return -1;
+		}
+	}
+	else {
+		perror("Error specify serial port");
+		return -1;
+	}
+
+	/* Read current serial port settings */
+	// tcgetattr(fd, &options);
+	
+	/* Set up serial port */
+	options.c_cflag = B115200 | CS8 | CLOCAL | CREAD;
+	options.c_iflag = IGNPAR;
+	options.c_oflag = 0;
+	options.c_lflag = 0;
+
+	/* Apply the settings */
+	tcflush(fd, TCIFLUSH);
+	tcsetattr(fd, TCSANOW, &options);
+
+
+	/* Configure radio */
+	printf("CONF: Configuring the radio\n\r");
+
+	process_cmd(fd, "AT+NWM=0\n\r");
+	sleep(1);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+
+
+	process_cmd(fd, "AT+P2P=915000000:7:0:0:6:5\n\r");
+	sleep(1);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+
+
+	process_cmd(fd, "AT+SYNCWORD=1424\n\r");
+	sleep(1);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+
+	printf("----------------------------\n\n");
+
+
+	/* Write to serial port */
+	printf("Waiting for input data...\n\n");
+	process_cmd(fd, "AT+PRECV=65534\n\r");
+	sleep(1);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+
+	signal(SIGINT, intHandler);
+
+	/* Read from serial port */
+	memset(packet, 0, BUFSIZE);
+	int packet_index = 0;
+
+	while (keepRunning) {
+		//sleep(1);
+		memset(rxbuf, 0, BUFSIZE);
+		len = read(fd, rxbuf, BUFSIZE);
+		if (len > 0) {
+			if ((packet_index+len)<256)  {
+				printf("RXD [%d] : %s", len, rxbuf);	
+
+				memcpy(&packet[packet_index], rxbuf, len);
+
+				/*** Check whether we have received the full data packet  ***/
+				/* OK message received */
+				//ret = strstr(rxbuf, "}\n\r");
+				//ret = strstr(rxbuf, "\n\rOK\n\r");
+				//if (((rxbuf[len-4] == '7') && (rxbuf[len-3] == 'D')) || (rxbuf[len-2] == 'K')) {
+				if ((strstr(packet, "}\n\r") != NULL) || (strstr(packet, "\n\rOK\n\r") != NULL)) {
+					if (process_msg(fd, packet, packet_index + len)) 
+						printf("OK rxd\n");
+					
+					packet_index=0;
+					memset(packet, 0, BUFSIZE);
+				}
+				else {
+					packet_index = len;
+				}
+			}
+			else {
+				printf("ERROR: buffer overflow\n");
+				goto DONE;
+				
+			}
+		}
+	}
+
+	printf("\nCompleted test.\n");
+	process_cmd(fd, "AT+PRECV=0\n\r");
+	sleep(5);
+	memset(rxbuf, 0, BUFSIZE);
+	len = read(fd, rxbuf, BUFSIZE);
+	if (len > 0) {
+		if (process_msg(fd, rxbuf, len)) printf("OK rxd\n");
+	}
+DONE:
+	close(fd);
+	return 0; 
+}
